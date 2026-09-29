@@ -1,0 +1,360 @@
+"""Pydantic Models and Data Structures for SAMPATI V2 UPI Mule Detection."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional, Union
+
+try:
+    from pydantic import BaseModel, Field
+except ImportError:
+    from app.models.pydantic_models import BaseModel, Field  # type: ignore
+
+
+def utcnow() -> datetime:
+    """Return current UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+SIMULATED_PSPS: List[str] = ["okaxis", "ybl", "paytm", "ibl"]
+VerdictAction = Literal["ALLOW", "HOLD", "BLOCK"]
+TxnType = Literal["P2P", "P2M", "COLLECT"]
+
+
+class RuleHit(BaseModel):
+    """A single explainable rule contribution to the risk score."""
+    code: str = Field(..., description="Unique rule code identifier")
+    points: int = Field(..., description="Risk points contributed by this rule")
+    detail: str = Field(default="", description="Detailed human-readable reason")
+
+
+class UpiTransaction(BaseModel):
+    """Incoming UPI Transaction payload for inline evaluation."""
+    txn_id: str = Field(..., description="Unique UPI transaction reference")
+    timestamp: datetime = Field(default_factory=utcnow, description="Transaction timestamp in UTC")
+    amount: float = Field(..., description="Transaction amount in INR")
+    txn_type: str = Field(default="P2P", description="UPI transaction type: P2P, P2M, COLLECT")
+    payer_vpa: str = Field(..., description="Payer Virtual Payment Address")
+    payer_psp: str = Field(default="", description="Payer PSP handle")
+    payer_account_age_days: int = Field(default=365, description="Age of payer bank account in days")
+    payee_vpa: str = Field(..., description="Payee Virtual Payment Address")
+    payee_psp: str = Field(default="", description="Payee PSP handle")
+    payee_vpa_age_days: int = Field(default=365, description="Age of payee VPA in days")
+    payee_is_new_for_payer: bool = Field(default=False, description="Whether this is first transfer between pair")
+    device_id: str = Field(default="", description="Payer device hardware fingerprint")
+    sim_id: str = Field(default="", description="Payer SIM card identifier")
+    note: str = Field(default="", description="Optional UPI payment note/remark")
+    ip: str = Field(default="", description="Payer IP address")
+    location: str = Field(default="", description="Geo location")
+
+    def __init__(self, **data: Any):
+        if "payer_vpa" in data and not data.get("payer_psp"):
+            vpa = data.get("payer_vpa", "")
+            data["payer_psp"] = vpa.split("@")[-1] if "@" in vpa else "unknown"
+        if "payee_vpa" in data and not data.get("payee_psp"):
+            vpa = data.get("payee_vpa", "")
+            data["payee_psp"] = vpa.split("@")[-1] if "@" in vpa else "unknown"
+        super().__init__(**data)
+
+
+class UpiEvaluationResponse(BaseModel):
+    """Response returned by inline UPI scoring gate."""
+    txn_id: str = Field(..., description="Transaction reference evaluated")
+    risk_score: int = Field(..., description="Composite risk score from 0 to 100")
+    action: str = Field(..., description="Decision verdict: ALLOW, HOLD, BLOCK")
+    reasons: List[str] = Field(default_factory=list, description="List of triggered rule reason strings")
+    rule_breakdown: List[RuleHit] = Field(default_factory=list, description="Detailed per-rule score contributions")
+    rule_score: int = Field(default=0, description="Layer 1 deterministic rule score")
+    adaptive_score: float = Field(default=0.0, description="Layer 2 adaptive anomaly score")
+    network_score: float = Field(default=0.0, description="Layer 3 federated graph network score")
+    ml_anomaly_score: float = Field(
+        default=0.0,
+        description="Unsupervised Isolation Forest multivariate anomaly score in [0.0, 1.0]",
+    )
+    supervised_fraud_score: float = Field(
+        default=0.0,
+        description="Supervised ML fraud probability score in [0.0, 1.0]",
+    )
+    mock_npci_score: float = Field(
+        default=0.0,
+        description="Simulated NPCI MuleHunter mule-probability score in [0.0, 1.0]",
+    )
+    mock_dpip_threat_level: Union[float, int, str] = Field(
+        default=0.0,
+        description="Simulated DPIP Smart Registry threat level score",
+    )
+    contributing_signals: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Contributing institutional signal sources with institution labels",
+    )
+    execution_latency_ms: float = Field(default=0.0, description="Decision latency in milliseconds")
+    evaluated_at: datetime = Field(default_factory=utcnow, description="Evaluation timestamp")
+    case_id: Optional[str] = Field(default=None, description="Investigative case ID if HOLD or BLOCK")
+    dmv_score: float = Field(default=0.0, description="Dead Money Velocity score (0-100)")
+    campaign_id: Optional[str] = Field(default=None, description="Active fraud campaign identifier if matched")
+
+
+class MuleRingSummary(BaseModel):
+    """Discovered cross-PSP mule ring summary."""
+    ring_id: str = Field(..., description="Unique ring identifier hash")
+    scenario: str = Field(..., description="Mule pattern scenario descriptor")
+    vpas: List[str] = Field(default_factory=list, description="Member VPAs involved in ring")
+    psps: List[str] = Field(default_factory=list, description="PSP handles involved in ring")
+    txn_ids: List[str] = Field(default_factory=list, description="Transaction references in ring")
+    total_amount: float = Field(default=0.0, description="Total INR volume transferred in ring")
+
+
+class LabeledUpiTransaction(BaseModel):
+    """Synthetic labeled UPI transaction for simulation and benchmark testing."""
+    txn: UpiTransaction = Field(..., description="Inner UPI transaction record")
+    label: str = Field(default="legit", description="Ground truth label: legit or fraud")
+    scenario: str = Field(default="p2p", description="Synthetic scenario pattern")
+    ring_id: Optional[str] = Field(default=None, description="Associated ring ID if part of syndicate")
+
+
+class FeedbackRequest(BaseModel):
+    """Human investigator case feedback payload."""
+    confirmed_fraud: Optional[bool] = Field(None, description="True if fraud confirmed, False if false positive")
+    confirmed: Optional[bool] = Field(None, description="Alias for confirmed_fraud")
+
+    @property
+    def is_confirmed_fraud(self) -> bool:
+        if self.confirmed_fraud is not None:
+            return bool(self.confirmed_fraud)
+        if self.confirmed is not None:
+            return bool(self.confirmed)
+        return False
+
+
+class SimulateRequest(BaseModel):
+    """Synthetic traffic simulation request."""
+    total_txns: int = Field(default=100, description="Number of transactions to simulate")
+    fraud_ratio: float = Field(default=0.15, description="Ratio of fraudulent transactions (0.0 to 1.0)")
+    seed: Optional[int] = Field(default=42, description="Random generator seed for reproducibility")
+    run_federation: bool = Field(default=True, description="Whether to trigger federation consensus after stream")
+
+
+class CaseStatusUpdateRequest(BaseModel):
+    """Request payload for updating investigative case status."""
+    status: str = Field(..., description="Target status: reviewed, escalated, dismissed, open")
+    notes: Optional[str] = Field(None, description="Analyst review commentary")
+    resolution_notes: Optional[str] = Field(None, description="Detailed resolution justification")
+    resolution: Optional[str] = Field(None, description="Custom resolution code")
+    escalate_to_dpip: Optional[bool] = Field(None, description="Explicit flag to trigger DPIP publishing")
+
+
+class AnalyticsSummary(BaseModel):
+    """Summary statistics for analytics dashboard."""
+    total_evaluated: int = Field(0, description="Total transactions evaluated")
+    total_flagged: int = Field(0, description="Total transactions flagged (HOLD + BLOCK)")
+    total_allowed: int = Field(0, description="Total transactions allowed")
+    total_held: int = Field(0, description="Total transactions held")
+    total_blocked: int = Field(0, description="Total transactions blocked")
+    fraud_rate_pct: float = Field(0.0, description="Percentage of evaluated transactions flagged")
+    avg_risk_score: float = Field(0.0, description="Average risk score across evaluations")
+    total_amount_protected: float = Field(0.0, description="Total INR amount in flagged transactions")
+
+
+class TimeSeriesBucket(BaseModel):
+    """Time-series bucket item for verdict trends."""
+    bucket: str = Field(..., description="Bucket identifier string")
+    timestamp: str = Field(..., description="Bucket start timestamp in ISO format")
+    allow: int = Field(0, description="Count of ALLOW verdicts")
+    hold: int = Field(0, description="Count of HOLD verdicts")
+    block: int = Field(0, description="Count of BLOCK verdicts")
+    total: int = Field(0, description="Total transactions in bucket")
+    fraud_rate_pct: float = Field(0.0, description="Fraud percentage in bucket")
+    total_amount: float = Field(0.0, description="Total INR volume in bucket")
+
+
+class RuleFrequencyItem(BaseModel):
+    """Frequency and severity breakdown for a specific detection rule."""
+    rule_id: str = Field(..., description="Detection rule identifier code")
+    rule_name: str = Field(..., description="Human-readable rule name")
+    trigger_count: int = Field(0, description="Number of times rule was triggered")
+    percentage: float = Field(0.0, description="Trigger percentage relative to total rule hits")
+    severity: str = Field("MEDIUM", description="Rule severity level: LOW, MEDIUM, HIGH, CRITICAL")
+
+
+class TopFlaggedAccountItem(BaseModel):
+    """Aggregated metrics for high-risk accounts."""
+    account_id: str = Field(..., description="Unique account / VPA identifier")
+    vpa: str = Field(..., description="Virtual Payment Address")
+    bank: str = Field("UNKNOWN", description="Associated bank name")
+    psp: str = Field("unknown", description="PSP handle identifier")
+    flagged_count: int = Field(0, description="Total times account was flagged in cases")
+    hold_count: int = Field(0, description="Times account was put on HOLD")
+    block_count: int = Field(0, description="Times account was BLOCKED")
+    total_flagged_amount: float = Field(0.0, description="Total INR volume flagged for this account")
+    avg_risk_score: float = Field(0.0, description="Average risk score for cases involving this account")
+    last_flagged_at: Optional[str] = Field(None, description="ISO timestamp of most recent flagged case")
+
+
+class BankDistributionItem(BaseModel):
+    """Bank and PSP breakdown of flagged payees."""
+    bank: str = Field(..., description="Standardized bank name")
+    psp: str = Field(..., description="Primary PSP handle")
+    count: int = Field(0, description="Number of flagged cases for this bank")
+    percentage: float = Field(0.0, description="Percentage of all flagged cases")
+    flagged_amount: float = Field(0.0, description="Total INR volume flagged under this bank")
+
+
+class AnalyticsResponse(BaseModel):
+    """Full analytics payload for charts, trends, and risk distributions."""
+    timestamp: str = Field(..., description="Report generation timestamp")
+    interval: str = Field("hourly", description="Resolution interval: hourly or daily")
+    summary: AnalyticsSummary = Field(default_factory=AnalyticsSummary, description="High-level metrics summary")
+    time_series: List[Dict[str, Any]] = Field(default_factory=list, description="Time-bucketed verdict counts")
+    rule_frequencies: List[Dict[str, Any]] = Field(default_factory=list, description="Rule trigger ranking")
+    top_flagged_accounts: List[Dict[str, Any]] = Field(default_factory=list, description="Top high-risk accounts")
+    bank_distribution: List[Dict[str, Any]] = Field(default_factory=list, description="Bank-wise fraud distribution")
+    workload_heatmap: List[Dict[str, Any]] = Field(default_factory=list, description="7x24 grid of flagged case volume")
+    top_dmv_vpas: List[Dict[str, Any]] = Field(default_factory=list, description="Top VPAs ranked by DMV score")
+    top_vpas_by_dmv: List[Dict[str, Any]] = Field(default_factory=list, description="Top VPAs ranked by DMV score alias")
+    active_campaigns: List[Dict[str, Any]] = Field(default_factory=list, description="Active fraud campaigns")
+
+
+class AutoFeedStartRequest(BaseModel):
+    rate_tps: float = Field(10.0, ge=0.1, le=50.0, description="Transactions per second (max 50)")
+    fraud_ratio: float = Field(0.2, ge=0.0, le=1.0, description="Ratio of fraudulent / high-risk transactions")
+    bursty: bool = Field(False, description="Enable bursty traffic pattern")
+
+
+class AutoFeedStatusResponse(BaseModel):
+    active: bool = Field(False, description="Whether the live auto-feed generator is active")
+    rate_tps: float = Field(10.0, description="Configured transactions per second rate")
+    fraud_ratio: float = Field(0.2, description="Target fraud ratio")
+    bursty: bool = Field(False, description="Bursty mode enabled")
+    txns_generated: int = Field(0, description="Total synthetic transactions generated")
+    started_at: Optional[str] = Field(None, description="ISO timestamp of when autofeed started")
+
+
+class AutoFeedControlResponse(BaseModel):
+    status: str = Field(..., description="Operation status: started, already_running, stopped, not_running")
+    active: bool = Field(..., description="Current active state")
+    rate_tps: Optional[float] = Field(None, description="Current TPS rate")
+
+
+
+class DetailedHealthResponse(BaseModel):
+    """Real-time system health and telemetry report."""
+    status: str = Field("ok", description="Overall health status")
+    service: str = Field("sampati-upi", description="Service identifier name")
+    version: str = Field("2.0.0", description="Service version string")
+    timestamp: str = Field(..., description="Health check timestamp")
+    uptime: Dict[str, Any] = Field(default_factory=dict, description="Process uptime information")
+    latency_ms: Dict[str, Any] = Field(default_factory=dict, description="Detection engine latency percentiles")
+    database: Dict[str, Any] = Field(default_factory=dict, description="Database connection and pool status")
+    redis: Dict[str, Any] = Field(default_factory=dict, description="Redis hot cache status and ping latency")
+    websocket: Dict[str, Any] = Field(default_factory=dict, description="WebSocket active connection hub metrics")
+    throughput: Dict[str, Any] = Field(default_factory=dict, description="Rolling throughput and evaluation counters")
+
+
+class FederationSignalRequest(BaseModel):
+    """Payload to submit a privacy-preserving federated VPA risk signal."""
+    vpa_hash: str = Field(..., description="SHA-256 hash or pseudonymized hash of suspicious VPA")
+    risk_level: Union[str, float] = Field(..., description="Risk level string (CRITICAL, HIGH, MEDIUM, LOW) or numeric score in [0.0, 1.0]")
+    ring_hash: Optional[str] = Field(default=None, description="Optional associated mule ring identifier")
+    node_id: Optional[str] = Field(default="peer_node", description="Reporting PSP node identifier")
+
+
+class FederationSignalResponse(BaseModel):
+    """Response returned upon successful signal ingestion."""
+    status: str = Field(default="accepted", description="Ingestion status")
+    vpa_hash: str = Field(..., description="Ingested VPA hash")
+    risk_level: Union[str, float] = Field(..., description="Recorded risk level")
+    federated_risk_score: float = Field(..., description="Normalized numerical risk score in [0.0, 1.0]")
+    ring_hash: Optional[str] = Field(default=None, description="Associated mule ring identifier")
+    timestamp: str = Field(..., description="UTC ISO timestamp of ingestion")
+    recorded_at: Optional[str] = Field(default=None, description="UTC ISO timestamp alias")
+
+
+class FederationQueryResponse(BaseModel):
+    """Response returned by fast federated risk query."""
+    vpa_hash: str = Field(..., description="Queried VPA hash")
+    federated_risk_score: float = Field(0.0, description="Normalized federated risk score in [0.0, 1.0]")
+    risk_level: Union[str, float] = Field("NONE", description="Risk level string or score")
+    ring_members: List[str] = Field(default_factory=list, description="Associated ring member VPA hashes")
+    reported_by_nodes: List[str] = Field(default_factory=list, description="List of reporting PSP nodes")
+    cached: bool = Field(default=True, description="Whether served from sub-5ms hot state cache")
+    last_updated: Optional[str] = Field(default=None, description="ISO timestamp of last signal")
+
+
+class HoneypotItem(BaseModel):
+    """Item record for a registered synthetic honeypot VPA."""
+    vpa: str = Field(..., description="Honeypot VPA address")
+    hit_count: int = Field(0, description="Total hits recorded against this honeypot")
+    amount_deflected: float = Field(0.0, description="Cumulative INR amount deflected")
+    last_hit_at: Optional[str] = Field(None, description="ISO timestamp of most recent hit")
+    status: str = Field("ACTIVE", description="Honeypot status")
+
+
+class HoneypotStatsResponse(BaseModel):
+    """Aggregated statistics for synthetic honeypot mesh network."""
+    status: str = Field("ok", description="Status string")
+    total_registered: int = Field(0, description="Total active honeypot VPAs")
+    total_hits: int = Field(0, description="Total lifetime hits recorded")
+    hits_24h: int = Field(0, description="Rolling 24-hour hit count")
+    total_amount_deflected: float = Field(0.0, description="Total INR volume deflected")
+    honeypots: List[HoneypotItem] = Field(default_factory=list, description="Per-honeypot metrics")
+    timestamp: str = Field(..., description="Timestamp of report")
+
+
+
+
+# --- Gemini AI Assistant & Copilot Models ---
+
+class ToolExecutionResult(BaseModel):
+    """Structured outcome and audit telemetry for an agentic tool execution."""
+    tool_name: str = Field(..., description="Canonical identifier of the executed tool")
+    arguments: Dict[str, Any] = Field(default_factory=dict, description="Arguments parsed and passed to the executor")
+    status: str = Field("success", description="Outcome status: success, error, skipped")
+    result_summary: str = Field(..., description="Human-readable outcome summary")
+    data: Optional[Dict[str, Any]] = Field(default=None, description="Detailed structured output payload")
+
+
+class AiCaseBriefingResponse(BaseModel):
+    """Structured AI briefing generated by Gemini for a specific fraud case."""
+    case_id: str = Field(..., description="Target Case ID")
+    executive_summary: str = Field(..., description="High-level forensic summary")
+    scam_classification: str = Field(..., description="Identified scam typology or modus operandi")
+    confidence_score: float = Field(0.85, description="Model confidence score in [0.0, 1.0]")
+    threat_level: str = Field("HIGH", description="Assessed threat severity")
+    ring_analysis: str = Field(..., description="Graph network and money flow breakdown")
+    key_indicators: List[str] = Field(default_factory=list, description="Key forensic triggers")
+    recommended_actions: List[str] = Field(default_factory=list, description="Prescribed remediation steps")
+    source: str = Field("gemini-ai", description="Generator source (gemini-ai or fallback)")
+    model: Optional[str] = Field(None, description="Model name used for generation")
+
+
+class AiChatRequest(BaseModel):
+    """Request payload for interactive analyst chat with case assistant."""
+    question: str = Field(..., description="Analyst query regarding the case")
+    history: Optional[List[Dict[str, str]]] = Field(default=None, description="Previous conversation turns")
+
+
+class GeminiChatResponse(BaseModel):
+    """Response returned from Gemini Assistant interactive chat."""
+    case_id: str = Field(..., description="Target Case ID")
+    question: str = Field(..., description="Analyst question asked")
+    answer: str = Field(..., description="Gemini Assistant response text")
+    reply: Optional[str] = Field(None, description="Direct alias for answer")
+    source: str = Field("gemini-ai", description="Generator source")
+    model: Optional[str] = Field(None, description="Model name used")
+    tool_executions: List[ToolExecutionResult] = Field(
+        default_factory=list,
+        description="List of platform tools autonomously executed during this chat interaction",
+    )
+
+    def __init__(self, **data: Any):
+        if "answer" in data and not data.get("reply"):
+            data["reply"] = data["answer"]
+        elif "reply" in data and not data.get("answer"):
+            data["answer"] = data["reply"]
+        super().__init__(**data)
+
+
+# Backward-compatible and Rebranding Aliases
+AiChatResponse = GeminiChatResponse
+GeminiAssistantBriefing = AiCaseBriefingResponse
+GeminiAssistantChatRequest = AiChatRequest
+GeminiAssistantChatResponse = GeminiChatResponse
